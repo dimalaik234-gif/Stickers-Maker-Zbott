@@ -1,5 +1,6 @@
 # handlers/sticker.py
 import asyncio
+from datetime import datetime, timedelta
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, InputSticker
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -11,8 +12,27 @@ from utils.img_processor import process_image
 
 router = Router()
 
-# Store temporary photo data for callback processing
+# Store temporary photo data for callback processing with timestamp
 pending_images = {}
+
+# Cleanup task interval (seconds)
+CLEANUP_INTERVAL = 300  # 5 minutes
+PENDING_TIMEOUT = 600  # 10 minutes
+
+
+async def cleanup_pending_images():
+    """Periodically clean up old pending images."""
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL)
+        current_time = datetime.now()
+        expired_users = [
+            user_id for user_id, (_, timestamp) in pending_images.items()
+            if current_time - timestamp > timedelta(seconds=PENDING_TIMEOUT)
+        ]
+        for user_id in expired_users:
+            del pending_images[user_id]
+        if expired_users:
+            print(f"🧹 Очищено {len(expired_users)} устаревших изображений")
 
 
 @router.message(F.photo | F.document)
@@ -30,8 +50,8 @@ async def handle_image(message: Message):
         await message.answer(get_text(lang, 'send_photo'))
         return
     
-    # Store file_id for callback processing
-    pending_images[user_id] = file_id
+    # Store file_id with timestamp for callback processing
+    pending_images[user_id] = (file_id, datetime.now())
     
     # Show processing mode buttons
     builder = InlineKeyboardBuilder()
@@ -58,9 +78,17 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
     lang = await get_user_lang(user_id)
     
     # Get stored file_id
-    file_id = pending_images.get(user_id)
-    if not file_id:
-        await callback.answer(get_text(lang, 'send_photo'), show_alert=True)
+    pending_data = pending_images.get(user_id)
+    if not pending_data:
+        await callback.answer(get_text(lang, 'callback_expired'), show_alert=True)
+        return
+    
+    file_id, timestamp = pending_data
+    
+    # Check if not expired
+    if datetime.now() - timestamp > timedelta(seconds=PENDING_TIMEOUT):
+        del pending_images[user_id]
+        await callback.answer(get_text(lang, 'callback_expired'), show_alert=True)
         return
     
     # Determine mode
@@ -161,8 +189,15 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
         await callback.message.edit_text(
             get_text(lang, 'error_telegram', error=str(e))
         )
+        print(f"❌ Telegram API Error: {e}")
     except Exception as e:
-        print(f"Error processing sticker: {e}")
+        print(f"❌ Error processing sticker: {e}")
+        import traceback
+        traceback.print_exc()
         await callback.message.edit_text(get_text(lang, 'error_general'))
     
     await callback.answer()
+
+
+# Start cleanup task
+asyncio.create_task(cleanup_pending_images())
