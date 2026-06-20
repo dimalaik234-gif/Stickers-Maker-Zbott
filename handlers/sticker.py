@@ -5,34 +5,49 @@ from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, InputSticker
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.enums import StickerFormat
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 import logging
 
-from database import get_user_pack, set_user_pack, get_user_lang
+from database import get_current_pack, get_user_lang
 from locales import get_text
 from utils.img_processor import process_image
 
 router = Router()
 logger = logging.getLogger(__name__)
 
-# Store temporary photo data for callback processing with timestamp
-pending_images = {}
 
-# Timeout for pending images
-PENDING_TIMEOUT = 600  # 10 minutes
+class StickerCreation(StatesGroup):
+    waiting_for_mode = State()
+    waiting_for_emoji = State()
+
+
+# Store temporary data
+pending_stickers = {}
+
+# Popular emojis
+POPULAR_EMOJIS = ["😊", "😂", "❤️", "👍", "🔥", "✨", "🎉", "😎", "🤔", "😍", "🥰", "😭", "💀", "🙏", "👌"]
 
 
 @router.message(F.photo)
-async def handle_photo(message: Message):
+async def handle_photo(message: Message, state: FSMContext):
     """Handle incoming photos."""
     user_id = message.from_user.id
     lang = await get_user_lang(user_id)
+    
+    # Check if user has active pack
+    current_pack = await get_current_pack(user_id)
+    if not current_pack:
+        await message.answer(get_text(lang, 'no_active_pack'))
+        return
     
     logger.info(f"📸 Получено фото от пользователя {user_id}")
     
     file_id = message.photo[-1].file_id
     
-    # Store file_id with timestamp
-    pending_images[user_id] = (file_id, datetime.now())
+    # Store file_id
+    await state.update_data(file_id=file_id, timestamp=datetime.now())
     
     # Show processing mode buttons
     builder = InlineKeyboardBuilder()
@@ -46,6 +61,7 @@ async def handle_photo(message: Message):
     )
     builder.adjust(1)
     
+    await state.set_state(StickerCreation.waiting_for_mode)
     await message.answer(
         get_text(lang, 'choose_mode'),
         reply_markup=builder.as_markup()
@@ -53,10 +69,16 @@ async def handle_photo(message: Message):
 
 
 @router.message(F.document)
-async def handle_document(message: Message):
+async def handle_document(message: Message, state: FSMContext):
     """Handle incoming documents (images only)."""
     user_id = message.from_user.id
     lang = await get_user_lang(user_id)
+    
+    # Check if user has active pack
+    current_pack = await get_current_pack(user_id)
+    if not current_pack:
+        await message.answer(get_text(lang, 'no_active_pack'))
+        return
     
     # Check if it's an image document
     if not message.document.mime_type or not message.document.mime_type.startswith('image/'):
@@ -67,8 +89,8 @@ async def handle_document(message: Message):
     
     file_id = message.document.file_id
     
-    # Store file_id with timestamp
-    pending_images[user_id] = (file_id, datetime.now())
+    # Store file_id
+    await state.update_data(file_id=file_id, timestamp=datetime.now())
     
     # Show processing mode buttons
     builder = InlineKeyboardBuilder()
@@ -82,52 +104,37 @@ async def handle_document(message: Message):
     )
     builder.adjust(1)
     
+    await state.set_state(StickerCreation.waiting_for_mode)
     await message.answer(
         get_text(lang, 'choose_mode'),
         reply_markup=builder.as_markup()
     )
 
 
-@router.callback_query(F.data.startswith("mode_"))
-async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
-    """Process sticker creation based on selected mode."""
+@router.callback_query(F.data.startswith("mode_"), StickerCreation.waiting_for_mode)
+async def process_mode_selection(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Process mode selection and show emoji picker."""
     user_id = callback.from_user.id
     lang = await get_user_lang(user_id)
     
-    logger.info(f"🎨 Пользователь {user_id} выбрал режим: {callback.data}")
-    
-    # Get stored file_id
-    pending_data = pending_images.get(user_id)
-    if not pending_data:
-        await callback.answer(get_text(lang, 'callback_expired'), show_alert=True)
-        logger.warning(f"⚠️ Нет pending image для пользователя {user_id}")
-        return
-    
-    file_id, timestamp = pending_data
-    
-    # Check if not expired
-    if datetime.now() - timestamp > timedelta(seconds=PENDING_TIMEOUT):
-        del pending_images[user_id]
-        await callback.answer(get_text(lang, 'callback_expired'), show_alert=True)
-        logger.warning(f"⏰ Истек таймаут для пользователя {user_id}")
-        return
-    
-    # Determine mode
     remove_bg = callback.data == "mode_remove_bg"
     
-    # Notify user
+    data = await state.get_data()
+    file_id = data.get('file_id')
+    
+    if not file_id:
+        await callback.answer(get_text(lang, 'callback_expired'), show_alert=True)
+        return
+    
+    # Process image
     await callback.message.edit_text(get_text(lang, 'processing'))
     
     try:
-        # Download image
-        logger.info(f"⬇️ Скачивание файла {file_id}")
+        # Download and process image
         file = await bot.get_file(file_id)
         image_bytes = await bot.download_file(file.file_path)
         image_data = image_bytes.read()
         
-        logger.info(f"🖼 Обработка изображения (remove_bg={remove_bg})")
-        
-        # Process image in executor to avoid blocking
         loop = asyncio.get_event_loop()
         processed_buffer = await loop.run_in_executor(
             None,
@@ -136,103 +143,138 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
             remove_bg
         )
         
-        logger.info(f"✅ Изображение обработано")
+        # Store processed image
+        await state.update_data(processed_image=processed_buffer.getvalue(), remove_bg=remove_bg)
         
-        # Get or create sticker pack
-        pack_short_name = await get_user_pack(user_id)
-        bot_info = await bot.get_me()
-        bot_username = bot_info.username
+        # Show emoji picker
+        builder = InlineKeyboardBuilder()
+        for emoji in POPULAR_EMOJIS:
+            builder.button(text=emoji, callback_data=f"emoji_{emoji}")
         
-        if not pack_short_name:
-            # Generate unique pack name
-            pack_short_name = f"pack_{user_id}_by_{bot_username}"
-            await set_user_pack(user_id, pack_short_name)
-            logger.info(f"📦 Создан новый pack_short_name: {pack_short_name}")
+        builder.button(text=get_text(lang, 'custom_emoji_input'), callback_data="emoji_custom")
+        builder.adjust(5)
         
-        # Ensure pack name includes bot username
-        if not pack_short_name.endswith(f"_by_{bot_username}"):
-            pack_short_name = f"{pack_short_name}_by_{bot_username}"
-            await set_user_pack(user_id, pack_short_name)
-        
-        # Prepare sticker file
-        sticker_file = BufferedInputFile(
-            processed_buffer.read(),
-            filename="sticker.png"
+        await state.set_state(StickerCreation.waiting_for_emoji)
+        await callback.message.edit_text(
+            get_text(lang, 'choose_emoji'),
+            reply_markup=builder.as_markup()
         )
         
-        # Create InputSticker object
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки: {e}")
+        await callback.message.edit_text(get_text(lang, 'error_general'))
+        await state.clear()
+    
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("emoji_"), StickerCreation.waiting_for_emoji)
+async def process_emoji_selection(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Process emoji selection and add sticker."""
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    
+    if callback.data == "emoji_custom":
+        await callback.message.edit_text(get_text(lang, 'custom_emoji_input'))
+        await callback.answer()
+        return
+    
+    emoji = callback.data.split("_", 1)[1]
+    
+    await add_sticker_to_pack(callback.message, state, bot, user_id, lang, emoji)
+    await callback.answer()
+
+
+@router.message(StickerCreation.waiting_for_emoji)
+async def process_custom_emoji(message: Message, state: FSMContext, bot: Bot):
+    """Process custom emoji text input."""
+    user_id = message.from_user.id
+    lang = await get_user_lang(user_id)
+    
+    emoji = message.text.strip()
+    
+    # Simple emoji validation
+    if len(emoji) > 10:
+        await message.answer("❌ Слишком длинный текст. Отправь только эмодзи.")
+        return
+    
+    await add_sticker_to_pack(message, state, bot, user_id, lang, emoji)
+
+
+async def add_sticker_to_pack(message, state: FSMContext, bot: Bot, user_id: int, lang: str, emoji: str):
+    """Add sticker to pack with given emoji."""
+    data = await state.get_data()
+    processed_image = data.get('processed_image')
+    
+    if not processed_image:
+        await message.answer(get_text(lang, 'error_general'))
+        await state.clear()
+        return
+    
+    current_pack = await get_current_pack(user_id)
+    if not current_pack:
+        await message.answer(get_text(lang, 'no_active_pack'))
+        await state.clear()
+        return
+    
+    pack_id, pack_name, pack_title, pack_type = current_pack
+    
+    # Determine sticker format based on pack type
+    if pack_type == "emoji":
+        sticker_format = StickerFormat.STATIC  # Custom emoji still uses static format
+    else:
+        sticker_format = StickerFormat.STATIC
+    
+    try:
+        status_msg = await message.answer(get_text(lang, 'adding_sticker'))
+        
+        # Prepare sticker
+        sticker_file = BufferedInputFile(processed_image, filename="sticker.png")
         input_sticker = InputSticker(
             sticker=sticker_file,
-            emoji_list=["😊"],
+            emoji_list=[emoji],
             format="static"
         )
         
-        await callback.message.edit_text(get_text(lang, 'adding_sticker'))
-        
-        logger.info(f"➕ Добавление стикера в пак {pack_short_name}")
-        
-        # Try to add to existing pack, create new if doesn't exist
+        # Try to add to existing pack
         try:
             await bot.add_sticker_to_set(
                 user_id=user_id,
-                name=pack_short_name,
+                name=pack_name,
                 sticker=input_sticker
             )
-            logger.info(f"✅ Стикер добавлен в существующий пак")
+            logger.info(f"✅ Стикер добавлен в пак {pack_name}")
         except TelegramBadRequest as e:
-            error_str = str(e)
-            logger.warning(f"⚠️ Ошибка добавления в пак: {error_str}")
-            
-            if "STICKERSET_INVALID" in error_str or "not found" in error_str.lower() or "STICKER_PACK_NAME_INVALID" in error_str:
-                # Create new sticker pack
-                pack_title = f"{callback.from_user.first_name}'s Stickers" if lang == 'en' else f"Стикеры {callback.from_user.first_name}"
-                
-                logger.info(f"🆕 Создание нового стикерпака: {pack_title}")
-                
-                # Need to recreate the file buffer since it was consumed
-                processed_buffer.seek(0)
-                sticker_file_new = BufferedInputFile(
-                    processed_buffer.read(),
-                    filename="sticker.png"
-                )
+            if "STICKERSET_INVALID" in str(e) or "not found" in str(e).lower():
+                # Create new pack
+                sticker_file_new = BufferedInputFile(processed_image, filename="sticker.png")
                 input_sticker_new = InputSticker(
                     sticker=sticker_file_new,
-                    emoji_list=["😊"],
+                    emoji_list=[emoji],
                     format="static"
                 )
                 
                 await bot.create_new_sticker_set(
                     user_id=user_id,
-                    name=pack_short_name,
+                    name=pack_name,
                     title=pack_title,
-                    stickers=[input_sticker_new]
+                    stickers=[input_sticker_new],
+                    sticker_format=sticker_format
                 )
-                logger.info(f"✅ Новый стикерпак создан")
+                logger.info(f"✅ Создан новый пак {pack_name}")
             else:
                 raise
         
-        # Send success message with link
-        pack_link = f"https://t.me/addstickers/{pack_short_name}"
-        await callback.message.edit_text(
+        # Send success
+        pack_link = f"https://t.me/addstickers/{pack_name}"
+        await status_msg.edit_text(
             get_text(lang, 'success', link=pack_link)
         )
         
-        logger.info(f"🎉 Успех! Ссылка: {pack_link}")
-        
-        # Clean up
-        if user_id in pending_images:
-            del pending_images[user_id]
-        
-    except TelegramBadRequest as e:
-        error_message = str(e)
-        logger.error(f"❌ Telegram API Error: {error_message}")
-        await callback.message.edit_text(
-            get_text(lang, 'error_telegram', error=error_message)
-        )
     except Exception as e:
-        logger.error(f"❌ Неожиданная ошибка: {e}")
+        logger.error(f"❌ Ошибка добавления стикера: {e}")
         import traceback
         traceback.print_exc()
-        await callback.message.edit_text(get_text(lang, 'error_general'))
+        await message.answer(get_text(lang, 'error_general'))
     
-    await callback.answer()
+    await state.clear()
