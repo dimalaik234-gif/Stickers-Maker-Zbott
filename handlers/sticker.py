@@ -5,52 +5,69 @@ from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, InputSticker
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
+import logging
 
 from database import get_user_pack, set_user_pack, get_user_lang
 from locales import get_text
 from utils.img_processor import process_image
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 # Store temporary photo data for callback processing with timestamp
 pending_images = {}
 
-# Cleanup task interval (seconds)
-CLEANUP_INTERVAL = 300  # 5 minutes
+# Timeout for pending images
 PENDING_TIMEOUT = 600  # 10 minutes
 
 
-async def cleanup_pending_images():
-    """Periodically clean up old pending images."""
-    while True:
-        await asyncio.sleep(CLEANUP_INTERVAL)
-        current_time = datetime.now()
-        expired_users = [
-            user_id for user_id, (_, timestamp) in pending_images.items()
-            if current_time - timestamp > timedelta(seconds=PENDING_TIMEOUT)
-        ]
-        for user_id in expired_users:
-            del pending_images[user_id]
-        if expired_users:
-            print(f"🧹 Очищено {len(expired_users)} устаревших изображений")
-
-
-@router.message(F.photo | F.document)
-async def handle_image(message: Message):
-    """Handle incoming photos or documents."""
+@router.message(F.photo)
+async def handle_photo(message: Message):
+    """Handle incoming photos."""
     user_id = message.from_user.id
     lang = await get_user_lang(user_id)
     
-    # Determine file to download
-    if message.photo:
-        file_id = message.photo[-1].file_id
-    elif message.document and message.document.mime_type and message.document.mime_type.startswith('image/'):
-        file_id = message.document.file_id
-    else:
+    logger.info(f"📸 Получено фото от пользователя {user_id}")
+    
+    file_id = message.photo[-1].file_id
+    
+    # Store file_id with timestamp
+    pending_images[user_id] = (file_id, datetime.now())
+    
+    # Show processing mode buttons
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=get_text(lang, 'mode_remove_bg'),
+        callback_data="mode_remove_bg"
+    )
+    builder.button(
+        text=get_text(lang, 'mode_keep_bg'),
+        callback_data="mode_keep_bg"
+    )
+    builder.adjust(1)
+    
+    await message.answer(
+        get_text(lang, 'choose_mode'),
+        reply_markup=builder.as_markup()
+    )
+
+
+@router.message(F.document)
+async def handle_document(message: Message):
+    """Handle incoming documents (images only)."""
+    user_id = message.from_user.id
+    lang = await get_user_lang(user_id)
+    
+    # Check if it's an image document
+    if not message.document.mime_type or not message.document.mime_type.startswith('image/'):
         await message.answer(get_text(lang, 'send_photo'))
         return
     
-    # Store file_id with timestamp for callback processing
+    logger.info(f"📄 Получен документ-изображение от пользователя {user_id}")
+    
+    file_id = message.document.file_id
+    
+    # Store file_id with timestamp
     pending_images[user_id] = (file_id, datetime.now())
     
     # Show processing mode buttons
@@ -77,10 +94,13 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
     lang = await get_user_lang(user_id)
     
+    logger.info(f"🎨 Пользователь {user_id} выбрал режим: {callback.data}")
+    
     # Get stored file_id
     pending_data = pending_images.get(user_id)
     if not pending_data:
         await callback.answer(get_text(lang, 'callback_expired'), show_alert=True)
+        logger.warning(f"⚠️ Нет pending image для пользователя {user_id}")
         return
     
     file_id, timestamp = pending_data
@@ -89,6 +109,7 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
     if datetime.now() - timestamp > timedelta(seconds=PENDING_TIMEOUT):
         del pending_images[user_id]
         await callback.answer(get_text(lang, 'callback_expired'), show_alert=True)
+        logger.warning(f"⏰ Истек таймаут для пользователя {user_id}")
         return
     
     # Determine mode
@@ -99,9 +120,12 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
     
     try:
         # Download image
+        logger.info(f"⬇️ Скачивание файла {file_id}")
         file = await bot.get_file(file_id)
         image_bytes = await bot.download_file(file.file_path)
         image_data = image_bytes.read()
+        
+        logger.info(f"🖼 Обработка изображения (remove_bg={remove_bg})")
         
         # Process image in executor to avoid blocking
         loop = asyncio.get_event_loop()
@@ -112,6 +136,8 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
             remove_bg
         )
         
+        logger.info(f"✅ Изображение обработано")
+        
         # Get or create sticker pack
         pack_short_name = await get_user_pack(user_id)
         bot_info = await bot.get_me()
@@ -121,6 +147,7 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
             # Generate unique pack name
             pack_short_name = f"pack_{user_id}_by_{bot_username}"
             await set_user_pack(user_id, pack_short_name)
+            logger.info(f"📦 Создан новый pack_short_name: {pack_short_name}")
         
         # Ensure pack name includes bot username
         if not pack_short_name.endswith(f"_by_{bot_username}"):
@@ -142,6 +169,8 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
         
         await callback.message.edit_text(get_text(lang, 'adding_sticker'))
         
+        logger.info(f"➕ Добавление стикера в пак {pack_short_name}")
+        
         # Try to add to existing pack, create new if doesn't exist
         try:
             await bot.add_sticker_to_set(
@@ -149,10 +178,16 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
                 name=pack_short_name,
                 sticker=input_sticker
             )
+            logger.info(f"✅ Стикер добавлен в существующий пак")
         except TelegramBadRequest as e:
-            if "STICKERSET_INVALID" in str(e) or "not found" in str(e).lower():
+            error_str = str(e)
+            logger.warning(f"⚠️ Ошибка добавления в пак: {error_str}")
+            
+            if "STICKERSET_INVALID" in error_str or "not found" in error_str.lower() or "STICKER_PACK_NAME_INVALID" in error_str:
                 # Create new sticker pack
                 pack_title = f"{callback.from_user.first_name}'s Stickers" if lang == 'en' else f"Стикеры {callback.from_user.first_name}"
+                
+                logger.info(f"🆕 Создание нового стикерпака: {pack_title}")
                 
                 # Need to recreate the file buffer since it was consumed
                 processed_buffer.seek(0)
@@ -172,6 +207,7 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
                     title=pack_title,
                     stickers=[input_sticker_new]
                 )
+                logger.info(f"✅ Новый стикерпак создан")
             else:
                 raise
         
@@ -181,23 +217,22 @@ async def process_sticker_mode(callback: CallbackQuery, bot: Bot):
             get_text(lang, 'success', link=pack_link)
         )
         
+        logger.info(f"🎉 Успех! Ссылка: {pack_link}")
+        
         # Clean up
         if user_id in pending_images:
             del pending_images[user_id]
         
     except TelegramBadRequest as e:
+        error_message = str(e)
+        logger.error(f"❌ Telegram API Error: {error_message}")
         await callback.message.edit_text(
-            get_text(lang, 'error_telegram', error=str(e))
+            get_text(lang, 'error_telegram', error=error_message)
         )
-        print(f"❌ Telegram API Error: {e}")
     except Exception as e:
-        print(f"❌ Error processing sticker: {e}")
+        logger.error(f"❌ Неожиданная ошибка: {e}")
         import traceback
         traceback.print_exc()
         await callback.message.edit_text(get_text(lang, 'error_general'))
     
     await callback.answer()
-
-
-# Start cleanup task
-asyncio.create_task(cleanup_pending_images())
