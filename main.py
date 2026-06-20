@@ -13,7 +13,7 @@ from handlers import common, sticker
 
 async def main():
     """Main entry point for the bot."""
-    # Configure logging with more details
+    # Configure logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -38,15 +38,24 @@ async def main():
             token=BOT_TOKEN,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML)
         )
+        
+        # Проверка токена
+        bot_info = await bot.get_me()
+        logger.info(f"✅ Бот подключен: @{bot_info.username} (ID: {bot_info.id})")
+        
         dp = Dispatcher()
     except Exception as e:
         logger.error(f"❌ Ошибка создания бота: {e}")
         return
     
     logger.info("📡 Регистрация обработчиков...")
-    # ВАЖНО: порядок имеет значение - common должен быть ПОСЛЕДНИМ
+    
+    # КРИТИЧЕСКИ ВАЖНО: Правильный порядок!
+    # 1. Сначала специфичные обработчики (sticker - фото/документы)
+    # 2. Потом общие обработчики (common - команды и catch-all)
     dp.include_router(sticker.router)
     dp.include_router(common.router)
+    
     logger.info("✅ Все обработчики зарегистрированы")
     
     logger.info("🚀 Запуск long polling...")
@@ -56,7 +65,7 @@ async def main():
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
-            drop_pending_updates=True  # Пропустить старые обновления при запуске
+            drop_pending_updates=True
         )
     except Exception as e:
         logger.error(f"❌ Ошибка во время polling: {e}")
@@ -73,3 +82,5 @@ if __name__ == "__main__":
         print("\n🛑 Остановка по Ctrl+C")
     except Exception as e:
         print(f"❌ Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
