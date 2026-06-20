@@ -1,6 +1,6 @@
 # handlers/common.py
 from aiogram import Router, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -10,13 +10,13 @@ from locales import get_text
 router = Router()
 
 
-@router.message(Command("start"))
+@router.message(CommandStart())
 async def cmd_start(message: Message):
     """Handle /start command."""
     user_id = message.from_user.id
     lang = await get_user_lang(user_id)
     
-    # Show language selection for new users
+    # Show language selection
     builder = InlineKeyboardBuilder()
     builder.button(text="🇷🇺 Русский", callback_data="lang_ru")
     builder.button(text="🇬🇧 English", callback_data="lang_en")
@@ -37,7 +37,7 @@ async def cmd_help(message: Message):
     await message.answer(get_text(lang, 'help'))
 
 
-@router.message(Command("language"))
+@router.message(Command("language", "lang"))
 async def cmd_language(message: Message):
     """Handle /language command."""
     user_id = message.from_user.id
@@ -69,8 +69,7 @@ async def process_language_selection(callback: CallbackQuery):
     await callback.answer()
 
 
-# ===== НОВЫЕ ОБРАБОТЧИКИ =====
-
+# Catch-all для текстовых сообщений (НЕ команд)
 @router.message(F.text & ~F.text.startswith('/'))
 async def handle_text_message(message: Message):
     """Handle all text messages that are not commands."""
@@ -80,6 +79,7 @@ async def handle_text_message(message: Message):
     await message.answer(get_text(lang, 'send_photo'))
 
 
+# Обработка стикеров
 @router.message(F.sticker)
 async def handle_sticker(message: Message):
     """Handle stickers sent to bot."""
@@ -89,6 +89,7 @@ async def handle_sticker(message: Message):
     await message.answer(get_text(lang, 'send_photo'))
 
 
+# Обработка других медиа
 @router.message(F.video | F.video_note | F.voice | F.audio | F.animation)
 async def handle_media(message: Message):
     """Handle video, voice, audio, and animations."""
@@ -98,13 +99,21 @@ async def handle_media(message: Message):
     await message.answer(get_text(lang, 'send_photo'))
 
 
-@router.callback_query()
-async def handle_unknown_callback(callback: CallbackQuery):
-    """Handle unknown or outdated callbacks."""
-    user_id = callback.from_user.id
+# Fallback для неизвестных команд
+@router.message(F.text.startswith('/'))
+async def handle_unknown_command(message: Message):
+    """Handle unknown commands."""
+    user_id = message.from_user.id
     lang = await get_user_lang(user_id)
     
-    await callback.answer(
-        get_text(lang, 'callback_expired'),
-        show_alert=True
-    )
+    await message.answer(get_text(lang, 'unknown_command'))
+
+
+# Catch-all для всех остальных типов сообщений
+@router.message()
+async def handle_any_message(message: Message):
+    """Handle any other message type."""
+    user_id = message.from_user.id
+    lang = await get_user_lang(user_id)
+    
+    await message.answer(get_text(lang, 'send_photo'))
